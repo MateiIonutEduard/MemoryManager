@@ -35,13 +35,13 @@ int main() {
 ## Core Components
 
 ### MemoryPool
-Central registry for tracking all memory allocations. Provides container management, reference counting, and automatic cleanup.
+Central registry for tracking all memory allocations. Provides container <br/>management, reference counting, and automatic cleanup.
 
 ### MemoryPointer
-Smart pointer wrapper that manages container references and automatic deallocation when references reach zero.
+Smart pointer wrapper that manages container references and <br/>automatic deallocation when references reach zero.
 
 ### MemoryArena
-High-performance arena allocator for scenarios requiring bulk allocations. All arena memory is freed simultaneously on destruction.<br/>
+High-performance arena allocator for scenarios requiring bulk allocations. <br/>All arena memory is freed simultaneously on destruction.<br/>
 
 ### Configuration
 ```c
