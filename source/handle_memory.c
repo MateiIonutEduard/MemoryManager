@@ -759,8 +759,11 @@ static void zero_memory(void* ptr, size_t size) {
 }
 
 #if MEM_THREAD_SAFE
-__attribute__((destructor))
-static void cleanup_threading(void) {
-    pthread_mutex_destroy(&g_pool_mutex);
-}
+#include <pthread.h>
+static pthread_mutex_t g_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define LOCK_POOL() pthread_mutex_lock(&g_pool_mutex)
+#define UNLOCK_POOL() pthread_mutex_unlock(&g_pool_mutex)
+#else
+#define LOCK_POOL() (void)0
+#define UNLOCK_POOL() (void)0
 #endif
