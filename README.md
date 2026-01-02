@@ -1,41 +1,71 @@
 # libmemkit
 
-A professional, thread-safe memory management library for C systems programming.<br/> 
-Provides smart pointers, memory pooling, and arena allocators with security-first design.
+**libmemkit** is a high-performance, security-oriented memory management library for C systems programming.<br/>
+It provides **reference-counted smart pointers**, **memory pooling**, and **arena allocators**, with optional **thread 
+safety**,<br/> **copy-on-write semantics**, and **deterministic container tracking**. The design emphasizes predictable 
+performance,<br/> low fragmentation, and defensive memory hygiene suitable for long-running or security-sensitive applications.
 
-## Features
+## Key Features
 
-- **Smart Pointers** with automatic reference counting
-- **Memory Pooling** for efficient allocation/deallocation
-- **Arena Allocators** for bulk allocations with O(1) performance
-- **Thread-Safe** operations with configurable locking
-- **Security-Focused** with automatic memory zeroing
-- **Debug Infrastructure** with validation and detailed logging
-- **Smart Reuse** with best-fit container selection
+1. **Reference-Counted Smart Pointers**
+- Automatic lifetime management via atomic or non-atomic refcounts
+- Copy-on-write (COW) semantics for shared containers
+- Deterministic container identity via FNV-1a hashing
+
+2. **Memory Pooling**
+- Centralized tracking of all allocations
+- O(1) container removal (swap-with-last)
+- Automatic pool growth and shrink heuristics
+- Orphaned container reuse with best-fit selection
+
+3. **Arena Allocators**
+- O(1) bump allocation
+- Excellent cache locality
+- Bulk deallocation with a single call
+- Automatic arena chaining for large workloads
+
+3. **Thread Safety (Optional)**
+- Compile-time configurable (MEM_THREAD_SAFE)
+- Mutex-protected pool operations
+- Atomic reference counting when enabled
+
+4. **Security-First Design**
+- All freed memory is zeroed before release
+- Containers are wiped before destruction
+- Defensive validation in debug builds
+
+5. **Debug Infrastructure**
+- Pool validation and integrity checks
+- Detailed pool and container dumps
+- Extensive internal consistency logging
+
+6. **Custom OOM Handling**
+- User-defined allocation failure hooks
+- Centralized failure reporting
 
 ## Quick Start
 
 ```c
-#include "handle_memory.h"
+#include "memkit.h"
 #include <stdio.h>
 
 int main(void) {
     MemoryPool pool;
     if (!mem_pool_init(&pool, 16)) {
-        fprintf(stderr, "Failed to initialize memory pool\n");
+        fprintf(stderr, "Failed to initialize memory pool.\n");
         return 1;
     }
 
     MemoryPointer* buffer = mem_pointer_create("data_buffer", 1024);
     if (!mem_pointer_allocate(buffer, 1024, &pool)) {
-        fprintf(stderr, "Allocation failed\n");
+        fprintf(stderr, "Allocation failed.\n");
         return 1;
     }
 
     // Use allocated memory
     int* data = (int*)buffer->container->data;
     data[0] = 42;
-    printf("Allocated %zu bytes, stored: %d\n", 
+    printf("Allocated %zu bytes, stored: %d.\n", 
            buffer->container->size, data[0]);
 
     // Cleanup
@@ -47,21 +77,44 @@ int main(void) {
 ## Core Components
 
 ### MemoryPool
-Central registry for tracking all memory allocations. Provides container <br/>management, reference counting, and automatic cleanup.
+The central registry for all active containers.
+
+* **Responsibilities**:
+   - Tracks container ownership and lifetime
+   - Enables reuse of orphaned containers
+   - Handles pool growth, shrinkage, and cleanup
 
 ### MemoryPointer
-Smart pointer wrapper that manages container references and <br/>automatic deallocation when references reach zero.
+
+- A smart pointer wrapper that references a `MemoryContainer`.
+- Automatically increments/decrements reference counts
+- Triggers copy-on-write when modifying shared containers
+- Human-readable variable names aid debugging and diagnostics
+
+### MemoryContainer
+The fundamental allocation unit managed by the library.
+
+- Owns a contiguous block of heap memory
+- Tracks size, reference count, and deterministic address
+- Destroyed automatically when reference count reaches zero
 
 ### MemoryArena
-High-performance arena allocator for scenarios requiring bulk allocations. <br/>All arena memory is freed simultaneously on destruction.<br/>
+A high-performance allocator for short-lived or bulk allocations.
+
+- Bump-pointer allocation
+- No per-allocation metadata
+- Entire arena freed in one operation
 
 ### Configuration
+All configuration is compile-time driven via macros:
+
 ```c
 #define MEM_POOL_DEFAULT_CAPACITY 32   /* initial pool size */
 #define MEM_ALIGNMENT 8                /* memory alignment */
 #define MEM_THREAD_SAFE 1              /* enable thread safety */
 #define DEBUG_MEMORY_MANAGER 1         /* enable debug features */
 ```
+
 ### Advanced Usage
 #### Arena Allocation<br/>
 ```c
