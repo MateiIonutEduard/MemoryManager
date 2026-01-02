@@ -3,7 +3,7 @@ find_path(libmemkit_INCLUDE_DIR memkit.h
     PATHS /usr/local/include /usr/include ${CMAKE_INSTALL_PREFIX}/include
 )
 
-find_library(libmemkit_LIBRARY MemoryManager
+find_library(libmemkit_LIBRARY libmemkit
     PATHS /usr/local/lib /usr/lib ${CMAKE_INSTALL_PREFIX}/lib
 )
 
