@@ -1,4 +1,4 @@
-## Description
+# libmemkit
 
 A professional, thread-safe memory management library for C systems programming.<br/> 
 Provides smart pointers, memory pooling, and arena allocators with security-first design.
