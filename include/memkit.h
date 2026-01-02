@@ -1,5 +1,5 @@
-#ifndef HANDLE_MEMORY_H
-#define HANDLE_MEMORY_H
+#ifndef MEMKIT_H
+#define MEMKIT_H
 
 #include <stddef.h>
 #include <stdbool.h>
@@ -80,7 +80,16 @@ bool mem_pool_init(MemoryPool* pool, size_t initial_capacity);
 */
 MemoryPointer* mem_pointer_create(const char* var_name, size_t size);
 
-
+/**
+ * @brief Creates a new memory container with allocated backing memory.
+ *
+ * Creates a MemoryContainer structure and allocates memory of the specified size.
+ * 
+ * The container manages both metadata and the actual allocated memory block.
+ * @param address Unique identifier for the container
+ * @param size Size of memory to allocate in bytes
+ * @return Pointer to newly created MemoryContainer, or NULL on failure.
+*/
 MemoryContainer* mem_container_create(size_t address, size_t size);
 
 /**
