@@ -3,9 +3,20 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#if MEM_THREAD_SAFE
+#include <pthread.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+#if MEM_THREAD_SAFE
+#define MEM_LOCK(pool) pthread_mutex_lock(&(pool)->lock)
+#define MEM_UNLOCK(pool) pthread_mutex_unlock(&(pool)->lock)
+#else
+#define MEM_LOCK(pool) (void)0
+#define MEM_UNLOCK(pool) (void)0
 #endif
 
 /* @brief Memory block container tracking ownership and references. */
@@ -47,6 +58,9 @@ struct MemoryPool {
     size_t capacity;
     size_t count;
     MemoryPool* next;
+#if MEM_THREAD_SAFE
+    pthread_mutex_t lock;
+#endif
 };
 
 /** 
@@ -77,6 +91,24 @@ MemoryContainer* mem_container_create(size_t address, size_t size);
  * @return false on failure or duplicate container
 */
 bool mem_pool_add_container(MemoryPool* pool, MemoryContainer* container);
+
+/**
+ * @brief Removes a container from pool and optionally destroys it.
+ *
+ * @param pool MemoryPool from which to remove container
+ * @param container Container to remove (must be in pool)
+ * @param destroy_if_last_ref If true, destroys container when ref_count <= 0
+ * @return true if container was found and removed
+ * @return false if container not found or parameters invalid
+ */
+bool remove_container_from_pool(MemoryPool* pool, MemoryContainer* container, bool destroy_if_last_ref);
+
+/**
+ * @brief Grows the pool capacity when full.
+ * @param pool MemoryPool to grow
+ * @return true on success, false on OOM
+ */
+bool grow_pool_capacity(MemoryPool* pool);
 
 /**
  * @brief Allocates or reallocates memory for a MemoryPointer.
@@ -123,7 +155,7 @@ size_t mem_compute_hash(const char* str);
  * @param pool Initialized MemoryPool
  * @return Number of containers currently in the pool
 */
-size_t mem_pool_get_count(MemoryPool* pool);
+size_t mem_pool_get_count(const MemoryPool* pool);
 
 /**
  * @brief Gets the total allocated memory in a pool.
@@ -217,6 +249,31 @@ void mem_set_oom_handler(void (*handler)(size_t requested));
 #define MEM_THREAD_SAFE 0
 #endif
 
+#ifndef SHRINK_POOL_THRESHOLD
+#define SHRINK_POOL_THRESHOLD 4
+#endif
+
+#ifndef MIN_POOL_CAPACITY
+#define MIN_POOL_CAPACITY 16
+#endif
+
+#ifndef REF_DEC
+#if MEM_THREAD_SAFE
+#define REF_DEC(container) __atomic_sub_fetch(&(container)->ref_count, 1, __ATOMIC_SEQ_CST)
+#define REF_INC(container) __atomic_add_fetch(&(container)->ref_count, 1, __ATOMIC_SEQ_CST)
+#else
+#define REF_DEC(container) ((container)->ref_count--)
+#define REF_INC(container) ((container)->ref_count++)
+#endif
+#endif
+
+#ifndef REF_GET
+#if MEM_THREAD_SAFE
+#define REF_GET(container) __atomic_load_n(&(container)->ref_count, __ATOMIC_RELAXED)
+#else
+#define REF_GET(container) ((container)->ref_count)
+#endif
+#endif
 
 #ifdef __cplusplus
 }

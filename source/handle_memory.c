@@ -7,12 +7,6 @@
 
 #if MEM_THREAD_SAFE
 #include <pthread.h>
-static pthread_mutex_t g_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
-#define LOCK_POOL() pthread_mutex_lock(&g_pool_mutex)
-#define UNLOCK_POOL() pthread_mutex_unlock(&g_pool_mutex)
-#else
-#define LOCK_POOL() (void)0
-#define UNLOCK_POOL() (void)0
 #endif
 
 #ifdef DEBUG_MEMORY_MANAGER
@@ -21,7 +15,6 @@ static pthread_mutex_t g_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define DEBUG_LOG(...) (void)0
 #endif
 
-static MemoryContainer* find_container_by_address(const MemoryPool* pool, size_t address);
 static bool grow_pool_capacity(MemoryPool* pool);
 static size_t align_size(size_t size);
 static void zero_memory(void* ptr, size_t size);
@@ -44,85 +37,179 @@ struct MemoryArena {
 
 
 bool mem_pool_init(MemoryPool* pool, size_t initial_capacity) {
+    /* validate parameters */
     if (!pool) {
 #ifdef DEBUG_MEMORY_MANAGER
         DEBUG_LOG("mem_pool_init: NULL pool pointer.");
 #endif
+        errno = EINVAL;
         return false;
     }
 
+    /* initialize structure to safe defaults */
+    pool->containers = NULL;
+    pool->capacity = 0;
+    pool->count = 0;
+    pool->next = NULL;
+
+#if MEM_THREAD_SAFE
+    /* initialize mutex, before any allocations */
+    int mutex_result = pthread_mutex_init(&pool->lock, NULL);
+    if (mutex_result != 0) {
+        switch (mutex_result) {
+        case EAGAIN: errno = EAGAIN; break;
+        case ENOMEM: errno = ENOMEM; break;
+        case EPERM:  errno = EPERM;  break;
+        default:     errno = EINVAL; break;
+        }
+#ifdef DEBUG_MEMORY_MANAGER
+        DEBUG_LOG("mem_pool_init: mutex init failed with error %d.", mutex_result);
+#endif
+        return false;
+    }
+#endif
+
+    /* determine capacity */
     if (initial_capacity == 0)
         initial_capacity = MEM_POOL_DEFAULT_CAPACITY;
 
-    LOCK_POOL();
+    /* check for potential overflow in size calculation */
+    if (initial_capacity > SIZE_MAX / sizeof(MemoryContainer*)) {
+#ifdef DEBUG_MEMORY_MANAGER
+        DEBUG_LOG("mem_pool_init: capacity %zu would overflow.", initial_capacity);
+#endif
+        goto error_cleanup;
+    }
+
+    size_t allocation_size = initial_capacity * sizeof(MemoryContainer*);
+
+    /* allocate container array with zero initialization */
     pool->containers = calloc(initial_capacity, sizeof(MemoryContainer*));
 
     if (!pool->containers) {
-        UNLOCK_POOL();
-        g_oom_handler(initial_capacity * sizeof(MemoryContainer*));
-        return false;
+        g_oom_handler(allocation_size);
+#ifdef DEBUG_MEMORY_MANAGER
+        DEBUG_LOG("mem_pool_init: calloc failed for %zu bytes.", allocation_size);
+#endif
+        goto error_cleanup;
     }
 
+    /* set pool properties */
     pool->capacity = initial_capacity;
     pool->count = 0;
     pool->next = NULL;
-    UNLOCK_POOL();
+
 #ifdef DEBUG_MEMORY_MANAGER
-    DEBUG_LOG("Pool initialized with capacity %zu.", initial_capacity);
+    DEBUG_LOG("Pool initialized: capacity=%zu, allocation=%zu bytes.",
+        initial_capacity, allocation_size);
 #endif
+
     return true;
+
+error_cleanup:
+    /* clean up in reverse order of initialization */
+    if (pool->containers) {
+        free(pool->containers);
+        pool->containers = NULL;
+    }
+
+#if MEM_THREAD_SAFE
+    /* only destroy mutex if it was successfully initialized */
+    pthread_mutex_destroy(&pool->lock);
+#endif
+
+    /* ensure structure is in a consistent state */
+    pool->capacity = 0;
+    pool->count = 0;
+    pool->next = NULL;
+
+    errno = ENOMEM;
+    return false;
 }
 
 void mem_pool_destroy(MemoryPool* pool) {
+    /* early return for NULL input */
     if (!pool) return;
     MemoryPool* current = pool;
-    MemoryPool* next_pool = NULL;
 
     while (current) {
-        LOCK_POOL();
+        /* store next pointer before modifying current */
+        MemoryPool* next_pool = current->next;
 
-        /* debug check before destruction */
+        /* lock the current pool for thread-safe destruction */
+        MEM_LOCK(current);
+
 #ifdef DEBUG_MEMORY_MANAGER
-        if (current->count > 0) {
+        /* debug logging for non-NULL containers */
+        if (current->count > 0 && current->containers) {
+            size_t live_containers = 0;
             for (size_t i = 0; i < current->count; i++) {
-                if (current->containers[i]) {
-                    DEBUG_LOG("Warning: Non-NULL container at index %zu before destruction.", i);
-                }
+                if (current->containers[i] && current->containers[i]->ref_count > 0)
+                    live_containers++;
+            }
+            if (live_containers > 0) {
+                DEBUG_LOG("Warning: %zu container(s) still referenced during pool destruction.",
+                    live_containers);
             }
         }
 #endif
 
-        /* destroy all containers */
+        /* destroy all containers in the pool */
         if (current->containers) {
             for (size_t i = current->count; i-- > 0; ) {
                 MemoryContainer* container = current->containers[i];
-                if (container) mem_container_destroy(container);
+                if (container) {
+                    /* check if container is still referenced */
+                    if (REF_GET(container) > 0) {
+#ifdef DEBUG_MEMORY_MANAGER
+                        DEBUG_LOG("Warning: Container %p still has %d references during destruction.",
+                            (void*)container->address, container->ref_count);
+#endif
+                        /* force destroy despite references */
+                        container->ref_count = 0;
+                    }
+                    mem_container_destroy(container);
+                }
             }
 
-            /* zero the containers array for security */
-            zero_memory(current->containers,
-                current->count * sizeof(MemoryContainer*));
+            /* calculate actual memory used for zeroing */
+            size_t allocated_bytes = current->capacity * sizeof(MemoryContainer*);
 
+            /* clear sensitive data from containers array */
+            zero_memory(current->containers, allocated_bytes);
+
+            /* free the containers array */
             free(current->containers);
             current->containers = NULL;
         }
 
-        /* store next pointer before clearing current */
-        next_pool = current->next;
-
-        /* clear pool metadata */
+        /* clear pool metadata while still holding lock */
         current->capacity = 0;
         current->count = 0;
         current->next = NULL;
-        UNLOCK_POOL();
 
-        /* zero the pool structure itself */
+        /* unlock before destroying mutex */
+        MEM_UNLOCK(current);
+
+#if MEM_THREAD_SAFE
+        /* destroy mutex, unlocked before destruction */
+        int mutex_result = pthread_mutex_destroy(&current->lock);
+        if (mutex_result != 0 && mutex_result != EBUSY) {
+#ifdef DEBUG_MEMORY_MANAGER
+            DEBUG_LOG("Warning: pthread_mutex_destroy failed with error %d.", mutex_result);
+#endif
+        }
+#endif
+
+        /* clear the entire pool structure for security */
         zero_memory(current, sizeof(MemoryPool));
+
+        /* move to next pool in chain */
         current = next_pool;
     }
 
 #ifdef DEBUG_MEMORY_MANAGER
-    DEBUG_LOG("Pool chain destroyed.");
+    DEBUG_LOG("Pool chain destroyed successfully.");
 #endif
 }
 
@@ -161,217 +248,388 @@ MemoryPointer* mem_pointer_create(const char* var_name, size_t size_hint) {
 }
 
 bool mem_pointer_allocate(MemoryPointer* ptr, size_t size, MemoryPool* pool) {
+    /* parameter validation with error codes */
     if (!ptr || !pool) {
-#ifdef DEBUG_MEMORY_MANAGER
+        errno = EINVAL;
         DEBUG_LOG("mem_pointer_allocate: NULL parameter.");
-#endif
         return false;
     }
 
     if (size == 0) {
-#ifdef DEBUG_MEMORY_MANAGER
+        errno = EINVAL;
         DEBUG_LOG("mem_pointer_allocate: zero size requested.");
-#endif
         return false;
     }
 
-    LOCK_POOL();
+    /* align size for memory alignment */
     size = align_size(size);
 
-    /* check if pointer already has a container */
-    if (ptr->container) {
-        if (ptr->container->size >= size && ptr->container->ref_count == 1) {
-#ifdef DEBUG_MEMORY_MANAGER
-            DEBUG_LOG("Reusing exclusive container %p for %s.",
-                (void*)ptr->container->address, ptr->variable_name);
-#endif
+    /* if we can't even align properly, fail fast */
+    if (size == 0) {
+        errno = EOVERFLOW;
+        DEBUG_LOG("mem_pointer_allocate: size alignment overflow.");
+        return false;
+    }
 
-            UNLOCK_POOL();
+    MEM_LOCK(pool);
+
+    /* handle existing container */
+    if (ptr->container) {
+        MemoryContainer* existing = ptr->container;
+        bool existing_released = false;
+        bool existing_destroyed = false;
+
+        /* container fits and is exclusively owned */
+        if (existing->size >= size && REF_GET(existing) == 1) {
+            MEM_UNLOCK(pool);
             return true;
         }
 
-        /* container is shared but size is sufficient */
-        if (ptr->container->size >= size && ptr->container->ref_count > 1) {
-#ifdef DEBUG_MEMORY_MANAGER
-            DEBUG_LOG("Container shared (%d refs), creating new one for %s.",
-                ptr->container->ref_count, ptr->variable_name);
-#endif
+        /* container fits but is shared */
+        if (existing->size >= size) {
+            MemoryContainer* new_container = mem_container_create(
+                mem_compute_hash(ptr->variable_name), size);
 
-            /* decrement ref count but do not remove from pool */
-            ptr->container->ref_count--;
-            ptr->container = NULL;
-        }
-        else {
-            /* Size insufficient or container needs replacement */
-#ifdef DEBUG_MEMORY_MANAGER
-            DEBUG_LOG("%s container insufficient: %zu < %zu bytes or needs replacement.",
-                ptr->variable_name, ptr->container->size, size);
-#endif
-
-            /* decrement ref count */
-            ptr->container->ref_count--;
-
-            /* if this was the last reference, find and remove from pool */
-            if (ptr->container->ref_count <= 0) {
-                bool found = false;
-
-                for (size_t i = 0; i < pool->count; i++) {
-                    /* move last element to this position */
-                    if (pool->containers[i] == ptr->container) {
-                        pool->containers[i] = pool->containers[pool->count - 1];
-                        pool->count--;
-                        found = true;
-
-                        /* destroy the orphaned container */
-                        mem_container_destroy(ptr->container);
-                        break;
-                    }
-                }
-
-                if (!found) {
-#ifdef DEBUG_MEMORY_MANAGER
-                    DEBUG_LOG("Warning: orphaned container not found in pool");
-#endif
-                    mem_container_destroy(ptr->container);
-                }
+            if (!new_container) {
+                MEM_UNLOCK(pool);
+                errno = ENOMEM;
+                return false;
             }
 
-            ptr->container = NULL;
+            /* copy data if source exists */
+            if (existing->data && new_container->data) {
+                size_t copy_size = existing->size < size ? existing->size : size;
+                memcpy(new_container->data, existing->data, copy_size);
+            }
+
+            /* decrement old container's ref count */
+            int remaining_refs = REF_DEC(existing);
+            existing_released = true;
+
+            /* remove from pool but don't destroy yet */
+            if (remaining_refs <= 0)
+                existing_destroyed = remove_container_from_pool(pool, existing, false);
+
+            /* add new container to pool with capacity check */
+            if (pool->count >= pool->capacity && !grow_pool_capacity(pool)) {
+                /* restore existing container if it was removed */
+                if (existing_destroyed) {
+                    if (pool->count >= pool->capacity && !grow_pool_capacity(pool))
+                        mem_container_destroy(existing);
+                    else {
+                        existing->ref_count = 1;
+                        pool->containers[pool->count++] = existing;
+                    }
+                }
+                else if (existing_released)
+                    REF_INC(existing);
+
+                /* clean up failed new container */
+                mem_container_destroy(new_container);
+                MEM_UNLOCK(pool);
+                errno = ENOMEM;
+                return false;
+            }
+
+            /* add new container to pool successfully */
+            pool->containers[pool->count++] = new_container;
+            ptr->container = new_container;
+
+            /* now safe to destroy old container if it was removed */
+            if (existing_destroyed)
+                mem_container_destroy(existing);
+
+            MEM_UNLOCK(pool);
+
+#ifdef DEBUG_MEMORY_MANAGER
+            DEBUG_LOG("COW allocation: %zu bytes for %s (from shared container).",
+                size, ptr->variable_name);
+#endif
+            return true;
         }
+
+        /* container doesn't fit, release it */
+        int remaining_refs = REF_DEC(existing);
+
+        if (remaining_refs <= 0)
+            remove_container_from_pool(pool, existing, true);
+        ptr->container = NULL;
     }
 
-    /* try to find an existing container that meets our needs */
-    MemoryContainer* existing_container = NULL;
+    /* try to reuse orphaned container */
+    MemoryContainer* best_fit = NULL;
     size_t best_fit_index = 0;
-    bool best_fit_found = false;
+    size_t best_fit_waste = SIZE_MAX;
 
     for (size_t i = 0; i < pool->count; i++) {
         MemoryContainer* candidate = pool->containers[i];
 
-        /* found an orphaned container that can be reused */
-        if (candidate && candidate->size >= size && candidate->ref_count == 0) {
-            if (!existing_container || candidate->size < existing_container->size) {
-                existing_container = candidate;
+        if (!candidate || candidate->ref_count != 0)
+            continue;
+
+        /* candidate must be at least the requested size */
+        if (candidate->size >= size) {
+            size_t waste = candidate->size - size;
+
+            /* perfect fit, use it immediately */
+            if (waste == 0) {
+                best_fit = candidate;
                 best_fit_index = i;
-                best_fit_found = true;
+                break;
+            }
+
+            /* track best fit with smallest waste */
+            if (waste < best_fit_waste) {
+                best_fit = candidate;
+                best_fit_index = i;
+                best_fit_waste = waste;
             }
         }
     }
 
-    if (best_fit_found) {
-        /* Reuse existing orphaned container */
-        DEBUG_LOG("Reusing orphaned container %p (size: %zu) for %s.",
-            (void*)existing_container->address, existing_container->size,
-            ptr->variable_name);
+    /* reuse orphaned container */
+    if (best_fit) {
+        best_fit->ref_count = 1;
+        ptr->container = best_fit;
 
-        /* update container metadata */
-        existing_container->ref_count = 1;
+        /* zero memory for security when reusing */
+        if (best_fit->data)
+            zero_memory(best_fit->data, best_fit->size);
+        MEM_UNLOCK(pool);
 
-        /* clear old data if needed */
-        if (existing_container->data)
-            zero_memory(existing_container->data, existing_container->size);
-
-        ptr->container = existing_container;
-        UNLOCK_POOL();
+#ifdef DEBUG_MEMORY_MANAGER
+        DEBUG_LOG("Reused orphaned container %p (size: %zu) for %s, waste: %zu bytes.",
+            (void*)best_fit->address, best_fit->size,
+            ptr->variable_name, best_fit_waste);
+#endif
         return true;
     }
 
-    /* create new container */
-    size_t address = mem_compute_hash(ptr->variable_name);
+    /* create a new container */
+    size_t address = mem_compute_hash(ptr->variable_name ? ptr->variable_name : "");
     MemoryContainer* container = mem_container_create(address, size);
 
     if (!container) {
-        UNLOCK_POOL();
+        MEM_UNLOCK(pool);
+        errno = ENOMEM;
         return false;
     }
 
-    /* add to the pool */
-    if (!mem_pool_add_container(pool, container)) {
+    /* add to pool with capacity check */
+    if (pool->count >= pool->capacity && !grow_pool_capacity(pool)) {
         mem_container_destroy(container);
-        UNLOCK_POOL();
+        MEM_UNLOCK(pool);
+        errno = ENOMEM;
         return false;
     }
 
+    /* success addition of container to the pool */
+    pool->containers[pool->count++] = container;
     ptr->container = container;
-    UNLOCK_POOL();
 
-    DEBUG_LOG("Allocated %zu bytes for %s at address %zu.",
+    MEM_UNLOCK(pool);
+
+#ifdef DEBUG_MEMORY_MANAGER
+    DEBUG_LOG("Allocated new container: %zu bytes for %s (address: 0x%zx).",
         size, ptr->variable_name, address);
+#endif
+
     return true;
 }
 
-static bool remove_container_from_pool(MemoryPool* pool, MemoryContainer* container) {
+bool remove_container_from_pool(MemoryPool* pool, MemoryContainer* container, bool destroy_if_last_ref) {
+    /* validate inputs */
+    if (!pool || !container) {
+        errno = EINVAL;
+#ifdef DEBUG_MEMORY_MANAGER
+        DEBUG_LOG("remove_container_from_pool: NULL pool or container.");
+#endif
+        return false;
+    }
+
+    if (!pool->containers) {
+        errno = EINVAL;
+#ifdef DEBUG_MEMORY_MANAGER
+        DEBUG_LOG("remove_container_from_pool: pool has NULL containers array.");
+#endif
+        return false;
+    }
+
+    bool found = false;
+    size_t found_index = 0;
+
+    /* find container in pool (O(n) search) */
     for (size_t i = 0; i < pool->count; i++) {
         if (pool->containers[i] == container) {
-            pool->containers[i] = pool->containers[pool->count - 1];
-            pool->count--;
+            found = true;
+            found_index = i;
+            break;
+        }
+    }
 
-            /* shrink pool if mostly empty */
-            if (pool->capacity > 64 && pool->count * 4 < pool->capacity) {
-                size_t new_capacity = pool->capacity / 2;
-                MemoryContainer** new_array = realloc(pool->containers,
-                    new_capacity * sizeof(MemoryContainer*));
+    if (!found) {
+        errno = ENOENT;
+#ifdef DEBUG_MEMORY_MANAGER
+        DEBUG_LOG("remove_container_from_pool: container %p not found in pool.",
+            (void*)container->address);
+#endif
+        return false;
+    }
+
+    /* remove container using swap-with-last technique (O(1) removal) */
+    size_t last_index = pool->count - 1;
+
+    /* swap with last element unless it's already the last */
+    if (found_index != last_index)
+        pool->containers[found_index] = pool->containers[last_index];
+
+    /* clear the last position */
+    pool->containers[last_index] = NULL;
+    pool->count--;
+
+#ifdef DEBUG_MEMORY_MANAGER
+    DEBUG_LOG("Removed container %p from pool (index %zu). Pool count: %zu.",
+        (void*)container->address, found_index, pool->count);
+#endif
+
+    const size_t shrink_threshold = SHRINK_POOL_THRESHOLD;
+    const size_t min_capacity = MIN_POOL_CAPACITY;
+
+    if (pool->capacity > min_capacity &&
+        pool->count * shrink_threshold < pool->capacity) {
+        size_t new_capacity = pool->capacity / 2;
+
+        /* ensure new capacity doesn't go below minimum */
+        if (new_capacity < min_capacity)
+            new_capacity = min_capacity;
+
+        /* ensure new capacity is at least current count */
+        if (new_capacity < pool->count)
+            new_capacity = pool->count;
+
+        /* only reallocate if there's significant space savings */
+        if (new_capacity < pool->capacity) {
+            if (new_capacity > SIZE_MAX / sizeof(MemoryContainer*)) {
+#ifdef DEBUG_MEMORY_MANAGER
+                DEBUG_LOG("Warning: Shrink size calculation would overflow.");
+#endif
+                /* Continue without shrinking */
+            }
+            else {
+                size_t new_size = new_capacity * sizeof(MemoryContainer*);
+                MemoryContainer** new_array = realloc(pool->containers, new_size);
 
                 if (new_array) {
                     pool->containers = new_array;
                     pool->capacity = new_capacity;
+
+#ifdef DEBUG_MEMORY_MANAGER
+                    DEBUG_LOG("Pool shrunk: capacity %zu -> %zu (count: %zu, savings: %zu bytes).",
+                        pool->capacity, new_capacity, pool->count,
+                        (pool->capacity - new_capacity) * sizeof(MemoryContainer*));
+#endif
+                }
+                else {
+#ifdef DEBUG_MEMORY_MANAGER
+                    DEBUG_LOG("Warning: Pool shrink realloc failed, keeping current capacity.");
+#endif
                 }
             }
-
-            return true;
         }
     }
 
-    return false;
+    /* handle container destruction if requested */
+    bool should_destroy = destroy_if_last_ref;
+
+    /* check if container is truly unreferenced */
+    if (should_destroy) {
+        int current_refs = REF_GET(container);
+
+        if (current_refs > 0) {
+#ifdef DEBUG_MEMORY_MANAGER
+            DEBUG_LOG("Warning: Container %p has %d refs but destroy requested.",
+                (void*)container->address, current_refs);
+#endif
+            should_destroy = false;
+        }
+        /* negative ref count indicates corruption */
+        else if (current_refs < 0) {
+#ifdef DEBUG_MEMORY_MANAGER
+            DEBUG_LOG("Error: Container %p has negative ref count: %d.",
+                (void*)container->address, current_refs);
+#endif
+            should_destroy = false;
+            errno = EFAULT;
+        }
+    }
+
+    if (should_destroy) {
+        mem_container_destroy(container);
+#ifdef DEBUG_MEMORY_MANAGER
+        DEBUG_LOG("Container %p destroyed after removal from pool.",
+            (void*)container->address);
+#endif
+    }
+
+    return true;
 }
 
 void mem_pointer_destroy(MemoryPointer* ptr, MemoryPool* pool) {
-    if (!ptr)  return;
+    if (!ptr) return;
+
 #ifdef DEBUG_MEMORY_MANAGER
-    DEBUG_LOG("Destroying pointer: %s.", ptr->variable_name ? ptr->variable_name : "<unnamed>");
+    const char* var_name = ptr->variable_name ? ptr->variable_name : "<unnamed>";
+    DEBUG_LOG("Destroying pointer: %s.", var_name);
 #endif
+
+    /* handle case where pool is NULL  */
+    if (!pool) {
+        if (ptr->container) {
+            if (REF_DEC(ptr->container) <= 0)
+                mem_container_destroy(ptr->container);
+            
+            ptr->container = NULL;
+        }
+
+        /* clean up pointer resources */
+        if (ptr->variable_name) {
+            zero_memory(ptr->variable_name, strlen(ptr->variable_name));
+            free(ptr->variable_name);
+        }
+
+        zero_memory(ptr, sizeof(MemoryPointer));
+        free(ptr);
+        return;
+    }
+
     MemoryContainer* container_to_destroy = NULL;
+    MEM_LOCK(pool);
 
-    /* update reference count and check if removal needed */
+    /* decrement reference count atomically */
     if (ptr->container) {
-        LOCK_POOL();
-
-        ptr->container->ref_count--;
-#ifdef DEBUG_MEMORY_MANAGER
-        DEBUG_LOG("Container refs decreased to %d.", ptr->container->ref_count);
-#endif
-
-        if (ptr->container->ref_count <= 0) {
-            /* mark for destruction, but do it outside lock */
+        if (REF_DEC(ptr->container) <= 0) {
             container_to_destroy = ptr->container;
 
-            /* remove from pool while it have the lock */
-            bool found = false;
-            for (size_t i = 0; i < pool->count; i++) {
-                if (pool->containers[i] == container_to_destroy) {
-                    pool->containers[i] = pool->containers[pool->count - 1];
-                    pool->count--;
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found) {
+            /* remove from pool but don't destroy yet */
+            if (!remove_container_from_pool(pool, container_to_destroy, false)) {
 #ifdef DEBUG_MEMORY_MANAGER
-                DEBUG_LOG("Warning: container not found in pool.");
+                DEBUG_LOG("Warning: Container %p not found in pool during destruction.",
+                    (void*)container_to_destroy);
 #endif
                 container_to_destroy = NULL;
             }
         }
 
-        UNLOCK_POOL();
+        ptr->container = NULL;
     }
 
-    /* destroy container outside of pool lock */
+    MEM_UNLOCK(pool);
+
+    /* destroy container outside lock to reduce contention */
     if (container_to_destroy)
         mem_container_destroy(container_to_destroy);
 
-    /* clean up pointer resources */
+    /* clean up pointer metadata */
     if (ptr->variable_name) {
         zero_memory(ptr->variable_name, strlen(ptr->variable_name));
         free(ptr->variable_name);
@@ -379,6 +637,62 @@ void mem_pointer_destroy(MemoryPointer* ptr, MemoryPool* pool) {
 
     zero_memory(ptr, sizeof(MemoryPointer));
     free(ptr);
+}
+
+/**
+ * @brief Finds container by address with binary search on sorted addresses.
+ *
+ * Note: Requires containers array to be sorted by address.
+ * For O(log n) lookup, call sort_containers_by_address() first.
+ *
+ * @param pool MemoryPool to search
+ * @param address Address to find
+ * @return MemoryContainer* if found, NULL otherwise
+ */
+static MemoryContainer* find_container_by_address(const MemoryPool* pool, size_t address) {
+    if (!pool || !pool->containers || address == 0)
+        return NULL;
+
+    /* linear search (O(n)), good enough for the small pools */
+    for (size_t i = 0; i < pool->count; i++) {
+        if (pool->containers[i] && pool->containers[i]->address == address)
+            return pool->containers[i];
+    }
+
+    return NULL;
+}
+
+/**
+ * @brief Sorts containers by address for O(log n) lookups.
+ *
+ * Call this periodically or when pool size changes significantly.
+ *
+ * @param pool MemoryPool to sort
+ */
+static void sort_containers_by_address(MemoryPool* pool) {
+    if (!pool || pool->count < 2)
+        return;
+
+    MEM_LOCK(pool);
+
+    /* simple insertion sort algorithm */
+    for (size_t i = 1; i < pool->count; i++) {
+        MemoryContainer* key = pool->containers[i];
+        size_t j = i;
+
+        while (j > 0 && pool->containers[j - 1]->address > key->address) {
+            pool->containers[j] = pool->containers[j - 1];
+            j--;
+        }
+
+        pool->containers[j] = key;
+    }
+
+    MEM_UNLOCK(pool);
+
+#ifdef DEBUG_MEMORY_MANAGER
+    DEBUG_LOG("Sorted %zu containers by address.", pool->count);
+#endif
 }
 
 MemoryContainer* mem_container_create(size_t address, size_t size) {
@@ -425,12 +739,12 @@ bool mem_pool_add_container(MemoryPool* pool, MemoryContainer* container) {
         return false;
     }
 
-    LOCK_POOL();
+    MEM_LOCK(pool);
 
     /* check for duplicates */
     for (size_t i = 0; i < pool->count; i++) {
         if (pool->containers[i] == container) {
-            UNLOCK_POOL();
+            MEM_UNLOCK(pool);
 #ifdef DEBUG_MEMORY_MANAGER
             DEBUG_LOG("Container %p already in pool.", (void*)container);
 #endif
@@ -441,13 +755,13 @@ bool mem_pool_add_container(MemoryPool* pool, MemoryContainer* container) {
     /* check if we need to grow the pool */
     if (pool->count >= pool->capacity) {
         if (!grow_pool_capacity(pool)) {
-            UNLOCK_POOL();
+            MEM_UNLOCK(pool);
             return false;
         }
     }
 
     pool->containers[pool->count++] = container;
-    UNLOCK_POOL();
+    MEM_UNLOCK(pool);
 #ifdef DEBUG_MEMORY_MANAGER
     DEBUG_LOG("Container added to pool, count=%zu.", pool->count);
 #endif
@@ -494,14 +808,14 @@ size_t mem_compute_hash(const char* str) {
     return hash;
 }
 
-size_t mem_pool_get_count(MemoryPool* pool) {
+size_t mem_pool_get_count(const MemoryPool* pool) {
     if (!pool)
         return 0;
 
-    LOCK_POOL();
+    MEM_LOCK(pool);
     size_t count = pool->count;
 
-    UNLOCK_POOL();
+    MEM_UNLOCK(pool);
     return count;
 }
 
@@ -509,7 +823,7 @@ size_t mem_pool_get_total_bytes(const MemoryPool* pool) {
     if (!pool)
         return 0;
 
-    LOCK_POOL();
+    MEM_LOCK(pool);
     size_t total = 0;
 
     for (size_t i = 0; i < pool->count; i++) {
@@ -517,7 +831,7 @@ size_t mem_pool_get_total_bytes(const MemoryPool* pool) {
             total += pool->containers[i]->size;
     }
 
-    UNLOCK_POOL();
+    MEM_UNLOCK(pool);
     return total;
 }
 
@@ -608,7 +922,7 @@ bool mem_pool_validate(const MemoryPool* pool) {
         return false;
     }
 
-    LOCK_POOL();
+    MEM_LOCK(pool);
     bool valid = true;
 
     /* check pool structure */
@@ -655,7 +969,7 @@ bool mem_pool_validate(const MemoryPool* pool) {
     }
 
 done:
-    UNLOCK_POOL();
+    MEM_UNLOCK(pool);
 
     if (valid)
         DEBUG_LOG("Pool validation passed.");
@@ -668,7 +982,7 @@ void mem_pool_dump(const MemoryPool* pool, bool detailed) {
         return;
     }
 
-    LOCK_POOL();
+    MEM_LOCK(pool);
 
     printf("=== Memory Pool Dump ===\n");
     printf("Containers: %zu/%zu\n", pool->count, pool->capacity);
@@ -692,7 +1006,7 @@ void mem_pool_dump(const MemoryPool* pool, bool detailed) {
         }
     }
 
-    UNLOCK_POOL();
+    MEM_UNLOCK(pool);
     printf("=== End Dump ===\n");
 }
 
@@ -703,44 +1017,106 @@ void mem_set_oom_handler(void (*handler)(size_t requested)) {
     else g_oom_handler = default_oom_handler;
 }
 
-static MemoryContainer* find_container_by_address(const MemoryPool* pool, size_t address) {
-    if (!pool || address == 0)
-        return NULL;
-
-    for (size_t i = 0; i < pool->count; i++) {
-        if (pool->containers[i] && pool->containers[i]->address == address)
-            return pool->containers[i];
-    }
-
-    return NULL;
-}
-
-static bool grow_pool_capacity(MemoryPool* pool) {
-    size_t new_capacity = pool->capacity * 2;
-
-    /* ensure minimum growth */
-    if (new_capacity < 8)
-        new_capacity = 8;
-
+bool grow_pool_capacity(MemoryPool* pool) {
+    /* validate input */
+    if (!pool) {
+        errno = EINVAL;
 #ifdef DEBUG_MEMORY_MANAGER
-    DEBUG_LOG("Growing pool capacity: %zu -> %zu.", pool->capacity, new_capacity);
+        DEBUG_LOG("grow_pool_capacity: NULL pool pointer.");
 #endif
-
-    MemoryContainer** new_containers = realloc(pool->containers,
-        new_capacity * sizeof(MemoryContainer*));
-    if (!new_containers) {
-        g_oom_handler(new_capacity * sizeof(MemoryContainer*));
         return false;
     }
 
-    /* zero new memory */
-    if (new_capacity > pool->capacity) {
-        zero_memory(&new_containers[pool->capacity],
-            (new_capacity - pool->capacity) * sizeof(MemoryContainer*));
+    if (!pool->containers && pool->capacity > 0) {
+        errno = EFAULT;
+#ifdef DEBUG_MEMORY_MANAGER
+        DEBUG_LOG("grow_pool_capacity: inconsistent pool state.");
+#endif
+        return false;
     }
 
+    /* calculate new capacity with overflow protection */
+    size_t new_capacity;
+
+    /* first allocation, use sensible default */
+    if (pool->capacity == 0) {
+        new_capacity = MEM_POOL_DEFAULT_CAPACITY;
+        if (new_capacity == 0)
+            new_capacity = MEM_POOL_DEFAULT_CAPACITY;
+    }
+    else {
+        /* check for overflow in multiplication */
+        if (pool->capacity > SIZE_MAX / 2) {
+            errno = EOVERFLOW;
+#ifdef DEBUG_MEMORY_MANAGER
+            DEBUG_LOG("grow_pool_capacity: capacity %zu would overflow when doubled.",
+                pool->capacity);
+#endif
+            return false;
+        }
+
+        new_capacity = pool->capacity * 2;
+
+        /* ensure we grow by at least a minimum amount for small pools */
+        if (new_capacity < 8)
+            new_capacity = 8;
+    }
+
+    /* check for overflow in size calculation */
+    if (new_capacity > SIZE_MAX / sizeof(MemoryContainer*)) {
+        errno = EOVERFLOW;
+#ifdef DEBUG_MEMORY_MANAGER
+        DEBUG_LOG("grow_pool_capacity: new size calculation would overflow.");
+#endif
+        return false;
+    }
+
+    size_t new_size = new_capacity * sizeof(MemoryContainer*);
+    size_t old_size = pool->capacity * sizeof(MemoryContainer*);
+
+#ifdef DEBUG_MEMORY_MANAGER
+    DEBUG_LOG("Growing pool: %zu -> %zu containers (%zu -> %zu bytes).",
+        pool->capacity, new_capacity, old_size, new_size);
+#endif
+
+    /* allocate new array */
+    MemoryContainer** new_containers;
+
+    /* reallocate existing array */
+    if (pool->containers)
+        new_containers = realloc(pool->containers, new_size);
+    else
+        /* first allocation */
+        new_containers = malloc(new_size);
+
+    /* out of memory thrown, call handler with requested size */
+    if (!new_containers) {
+        g_oom_handler(new_size);
+        errno = ENOMEM;
+#ifdef DEBUG_MEMORY_MANAGER
+        DEBUG_LOG("grow_pool_capacity: failed to allocate %zu bytes.", new_size);
+#endif
+        return false;
+    }
+
+    /* zero the newly allocated portion safely */
+    if (new_capacity > pool->capacity) {
+        size_t zero_start = pool->capacity;
+        size_t zero_count = new_capacity - pool->capacity;
+
+        /* use memset for better performance */
+        memset(&new_containers[zero_start], 0,
+            zero_count * sizeof(MemoryContainer*));
+    }
+
+    /* update pool structure atomically */
     pool->containers = new_containers;
     pool->capacity = new_capacity;
+
+#ifdef DEBUG_MEMORY_MANAGER
+    DEBUG_LOG("Pool grown successfully to capacity %zu.", new_capacity);
+#endif
+
     return true;
 }
 
